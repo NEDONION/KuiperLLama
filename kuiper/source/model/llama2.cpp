@@ -1,3 +1,4 @@
+// LLama2模型实现：LLama2模型的具体实现，包括层创建、前向推理等
 #include "model/llama2.h"
 #include <glog/logging.h>
 #include <sentencepiece_processor.h>
@@ -7,11 +8,18 @@
 #include "sampler/mult_sampler.h"
 namespace model {
 
+// LLama2Model构造函数
+// @param token_path tokenizer文件路径
+// @param model_path 模型权重文件路径
 LLama2Model::LLama2Model(std::string token_path, std::string model_path)
     : Model(base::ModelType::kModelTypeLLama2, std::move(token_path),
             std::move(model_path)) {
 }
 
+// 初始化LLama2模型
+// 步骤：1. 验证路径 2. 加载模型文件 3. 初始化内存 4. 创建采样器
+// @param device_type 运行设备类型
+// @return 操作状态
 base::Status LLama2Model::init(base::DeviceType device_type) {
   using namespace base;
   if (token_path_.empty()) {
@@ -19,46 +27,68 @@ base::Status LLama2Model::init(base::DeviceType device_type) {
   }
 
   device_type_ = device_type;
+  // 从文件生成模型（加载配置、权重、创建层）
   Status read_status = gen_model_from_file();
   if (!read_status) {
     return read_status;
   }
+  // 初始化内存（分配所有缓冲区）
   init_mem();
+  // 创建采样器（用于生成下一个token）
   sampler_ = std::make_unique<sampler::ArgmaxSampler>();
   return error::Success();
 }
 
+// 前向推理主函数
+// 该函数实现了完整的自回归生成流程，包括两个阶段：
+// 1. Prefill阶段：处理输入的prompt token
+// 2. Generation阶段：逐个生成新token
+// @param tokens 输入token序列
+// @param total_steps 最大生成步数
+// @return 操作状态
 base::Status LLama2Model::forward(const std::vector<int>& tokens, int32_t total_steps) {
   if (tokens.empty()) {
     return base::error::InvalidArgument("The token array is empty.");
   }
   CHECK(device_type_ == base::DeviceType::kDeviceCPU);
 
+  // 将输入token转换为embedding向量
   const auto& embedding_output = embedding(tokens);
-  int32_t pos = 0;
-  int32_t next = -1;
-  int32_t eos = encode_layer_->eos();
+  int32_t pos = 0;       // 当前处理位置
+  int32_t next = -1;     // 下一个生成的token
+  int32_t eos = encode_layer_->eos();  // 结束符token
   tensor::Tensor pos_tensor = get_buffer(ModelBufferType::kInputPos);
+
+  // 自回归生成循环
   while (pos < total_steps) {
-    // set input and pos
+    // 设置当前位置和输入
     pos_tensor.index<int32_t>(0) = pos;
     tensor::Tensor input(base::DataType::kDataTypeFp32, config_->dim_);
     fill_input(next, pos_tensor, tokens, input, embedding_output);
 
+    // 遍历所有Transformer层
     for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
+      // 1. 注意力前的RMSNorm归一化
       attention_rms(layer_idx, input);
 
-      // attention (wq wk wv @ input)
+      // 2. 计算注意力的QKV（Query, Key, Value）
       attention_qkv(layer_idx, pos_tensor);
-      // multi-head attention
+
+      // 3. 执行多头注意力计算
       attention_mha(layer_idx, pos_tensor);
-      // feed forward
+
+      // 4. 执行前馈网络（FFN）
       feed_forward(layer_idx, input);
     }
 
+    // 计算最终的分类logits
     cls_logits(input);
+
+    // 采样下一个token并解码为文本
     const std::string& decode_str = post_processing(pos, next, tokens);
     LOG(INFO) << decode_str;
+
+    // 如果生成了结束符，则停止生成
     if (next == eos) {
       break;
     }
@@ -67,11 +97,15 @@ base::Status LLama2Model::forward(const std::vector<int>& tokens, int32_t total_
   return base::error::Success();
 }
 
+// 创建不带参数的层（无需加载权重）
+// 包括：RoPE层、多头注意力层、加法层、SwiGLU层
 void LLama2Model::create_nonparam_layers() {
   CHECK(llama_layers_ != nullptr);
+  // 创建RoPE（旋转位置编码）层
   llama_layers_->rope_layer_ = std::make_shared<op::RoPELayer>(
       device_type_, config_->dim_, config_->kv_dim_, config_->head_size_);
 
+  // 为每个Transformer块创建多头注意力层
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto mha_layer = std::make_shared<op::MultiHeadAttention>(
         device_type_, i, config_->kv_mul_, config_->kv_dim_, config_->seq_len_,
@@ -79,14 +113,19 @@ void LLama2Model::create_nonparam_layers() {
     llama_layers_->mha_layers_.push_back(mha_layer);
   }
 
+  // 创建向量加法层（用于残差连接）
   llama_layers_->add_layer_ = std::make_shared<op::VecAddLayer>(device_type_);
+  // 创建SwiGLU激活函数层（用于FFN）
   llama_layers_->swiglu_layer_ =
       std::make_shared<op::SwiGLULayer>(device_type_, config_->hidden_dim_);
 }
 
+// 创建带参数的层并加载权重
+// 包括：Embedding层、注意力权重矩阵（wq/wk/wv/wo）、FFN权重矩阵（w1/w2/w3）、RMSNorm层、分类层
+// 该函数按照模型文件中的权重排列顺序依次加载所有权重
 void LLama2Model::create_param_layers() {
   CHECK(llama_layers_ != nullptr);
-  // The embedding layer
+  // 创建Embedding层并加载权重
   llama_layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
       device_type_, config_->dim_, config_->seq_len_, std::abs(config_->vocab_size_));
 
@@ -94,10 +133,11 @@ void LLama2Model::create_param_layers() {
   llama_layers_->embedding_layer_->set_weight(
       0, {std::abs(config_->vocab_size_), config_->dim_}, weight_embedding, device_type_);
 
-  // create all matmul layer
+  // 创建所有矩阵乘法层并加载权重
   int32_t dim = config_->dim_;
   size_t pos = dim * std::abs(config_->vocab_size_) + dim * config_->layer_num_;
-  // create weight matrix for query
+
+  // 为每层创建Query权重矩阵（wq）
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim);
     wq->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), device_type_);
@@ -105,7 +145,7 @@ void LLama2Model::create_param_layers() {
     llama_layers_->wq_layers_.push_back(wq);
   }
 
-  // create weight matrix for key
+  // 为每层创建Key权重矩阵（wk）
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto wk = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim);
     wk->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos),
@@ -114,7 +154,7 @@ void LLama2Model::create_param_layers() {
     pos += config_->kv_dim_ * dim;
   }
 
-  // create weight matrix for value
+  // 为每层创建Value权重矩阵（wv）
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto wv = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim);
     wv->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos),
@@ -123,7 +163,7 @@ void LLama2Model::create_param_layers() {
     pos += config_->kv_dim_ * dim;
   }
 
-  // create weight matrix for output
+  // 为每层创建注意力输出权重矩阵（wo）
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto wo = std::make_shared<op::MatmulLayer>(device_type_, dim, dim);
     wo->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), device_type_);
@@ -131,10 +171,10 @@ void LLama2Model::create_param_layers() {
     pos += dim * dim;
   }
 
-  // skip ffn rmsnorm
+  // 跳过注意力后的RMSNorm权重（稍后加载）
   pos += config_->layer_num_ * dim;
 
-  // w1 layers
+  // 为每层创建FFN第一层权重矩阵（w1，用于SwiGLU的gate）
   int32_t hidden_dim = config_->hidden_dim_;
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto w1 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim);
@@ -144,7 +184,7 @@ void LLama2Model::create_param_layers() {
     pos += dim * hidden_dim;
   }
 
-  // w2 layers
+  // 为每层创建FFN第二层权重矩阵（w2，降维层）
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto w2 = std::make_shared<op::MatmulLayer>(device_type_, dim, hidden_dim);
     w2->set_weight(0, {dim, hidden_dim}, this->raw_model_data_->weight(pos),
@@ -153,7 +193,7 @@ void LLama2Model::create_param_layers() {
     pos += dim * hidden_dim;
   }
 
-  // w3 layers
+  // 为每层创建FFN第三层权重矩阵（w3，用于SwiGLU的up）
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto w3 = std::make_shared<op::MatmulLayer>(device_type_, hidden_dim, dim);
     w3->set_weight(0, {hidden_dim, dim}, this->raw_model_data_->weight(pos),
@@ -220,11 +260,16 @@ void LLama2Model::create_param_layers() {
   llama_layers_->rmsnorm_layers_.push_back(rms_final_layer);
 }
 
+// 将文本编码为token序列
+// @param sentence 输入文本
+// @return token序列
 std::vector<int32_t> LLama2Model::encode(const std::string& sentence) const {
   CHECK(encode_layer_ != nullptr);
   return encode_layer_->encode(sentence);
 }
 
+// 初始化模型内存（分配所有缓冲区）
+// 包括：输入token、embedding、KV缓存、中间结果等
 void LLama2Model::init_mem() {
   auto alloc = base::CPUDeviceAllocatorFactory::get_instance();
   int32_t max_seq_len = config_->seq_len_;
